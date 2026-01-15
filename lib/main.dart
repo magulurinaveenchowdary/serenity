@@ -8,26 +8,34 @@
 // flutter_local_notifications: ^17.0.0
 // timezone: ^0.9.2
 // flutter_timezone: ^1.0.8
-import 'dart:io';
-import 'package:flutter/services.dart';
-import 'package:flutter_local_notifications/flutter_local_notifications.dart';
-
 import 'dart:async';
+import 'dart:io';
 import 'dart:math';
+import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:flutter_local_notifications/flutter_local_notifications.dart';
-import 'package:timezone/data/latest.dart' as tz;
-import 'package:timezone/timezone.dart' as tz;
-import 'package:flutter_timezone/flutter_timezone.dart';
-import 'package:flutter/services.dart';
-import 'dart:io';
-import 'package:flutter/foundation.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'alarm_integration.dart';
+
+final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await NotificationService.init();
+  // Listen for native full-screen alarm activity to push Ringing UI
+  const MethodChannel('serenity/current_alarm').setMethodCallHandler((call) async {
+    if (call.method == 'push') {
+      final args = Map<String, dynamic>.from(call.arguments as Map);
+      final id = (args['alarm_id'] as num?)?.toInt() ?? DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      final label = (args['label'] as String?) ?? 'Alarm';
+      navigatorKey.currentState?.push(
+        MaterialPageRoute(builder: (_) => RingingScreen(alarmId: id, label: label)),
+      );
+    }
+    return null;
+  });
   runApp(const SerenityApp());
 }
 
@@ -72,7 +80,19 @@ class _SerenityAppState extends State<SerenityApp> {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
+      navigatorKey: navigatorKey,
       themeMode: mode,
+      onGenerateRoute: (settings) {
+        final name = settings.name ?? '';
+        if (name.startsWith('/ringing') || name.startsWith('ringing')) {
+          final uri = Uri.parse(name.startsWith('/') ? name : '/$name');
+          final idStr = uri.queryParameters['alarm_id'];
+          final id = int.tryParse(idStr ?? '') ?? DateTime.now().millisecondsSinceEpoch ~/ 1000;
+          final label = uri.queryParameters['label'] ?? 'Alarm';
+          return MaterialPageRoute(builder: (_) => RingingScreen(alarmId: id, label: label));
+        }
+        return null; // fallback to default
+      },
 
       theme: ThemeData(
         useMaterial3: false,
@@ -215,21 +235,48 @@ class _ShellState extends State<Shell> {
 
 // ---------------- ALARM ----------------
 class Alarm {
+  int id;
   int hour;
   int minute;
   bool isAm;
   String label;
   List<int> repeatDays; // 1=Mon ... 7=Sun
   bool sunrise;
+  bool enabled;
 
   Alarm({
+    required this.id,
     required this.hour,
     required this.minute,
     required this.isAm,
     required this.label,
     required this.repeatDays,
     required this.sunrise,
+    this.enabled = true,
   });
+
+  Map<String, dynamic> toMap() => {
+        'id': id,
+        'hour': hour,
+        'minute': minute,
+        'isAm': isAm,
+        'label': label,
+        'repeatDays': repeatDays,
+        'sunrise': sunrise,
+        'enabled': enabled,
+      };
+
+  static Alarm fromMap(Map<String, dynamic> m) => Alarm(
+        id: m['id'] as int,
+        hour: m['hour'] as int,
+        minute: m['minute'] as int,
+        isAm: m['isAm'] as bool,
+        label: (m['label'] ?? '') as String,
+        repeatDays:
+            (m['repeatDays'] as List<dynamic>? ?? const []).map((e) => e as int).toList(),
+        sunrise: (m['sunrise'] ?? false) as bool,
+        enabled: (m['enabled'] ?? true) as bool,
+      );
 }
 
 class AlarmScreen extends StatefulWidget {
@@ -253,6 +300,7 @@ class _AlarmScreenState extends State<AlarmScreen> {
         _now = DateTime.now();
       });
     });
+    _loadAlarms();
   }
 
   @override
@@ -304,6 +352,28 @@ class _AlarmScreenState extends State<AlarmScreen> {
 
   // ================= HELPERS =================
 
+  Future<void> _loadAlarms() async {
+    final p = await SharedPreferences.getInstance();
+    final s = p.getString('alarms');
+    if (s == null || s.isEmpty) return;
+    try {
+      final list = (jsonDecode(s) as List<dynamic>)
+          .map((e) => Alarm.fromMap(Map<String, dynamic>.from(e)))
+          .toList();
+      setState(() {
+        alarms
+          ..clear()
+          ..addAll(list);
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _saveAlarms() async {
+    final p = await SharedPreferences.getInstance();
+    final s = jsonEncode(alarms.map((a) => a.toMap()).toList());
+    await p.setString('alarms', s);
+  }
+
   Future<void> _addAlarm() async {
     final alarm = await showModalBottomSheet<Alarm>(
       context: context,
@@ -314,6 +384,7 @@ class _AlarmScreenState extends State<AlarmScreen> {
 
     if (alarm != null) {
       setState(() => alarms.add(alarm));
+      await _saveAlarms();
     }
   }
 
@@ -356,11 +427,74 @@ class _AlarmScreenState extends State<AlarmScreen> {
             ),
             child: const Icon(Icons.delete, color: Colors.red),
           ),
-          onDismissed: (_) => setState(() => alarms.removeAt(i)),
-          child: _AlarmCard(alarm: alarm),
+          onDismissed: (_) async {
+            final removed = alarms.removeAt(i);
+            setState(() {});
+            try { await AlarmIntegration.cancel(removed.id); } catch (_) {}
+            await _saveAlarms();
+          },
+          child: GestureDetector(
+            onTap: () => _editAlarm(alarm, i),
+            child: _AlarmCard(alarm: alarm),
+          ),
         );
       },
     );
+  }
+
+  Future<void> _editAlarm(Alarm alarm, int index) async {
+    final updated = await showModalBottomSheet<Alarm>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => EditAlarmSheet(alarm: alarm),
+    );
+
+    if (updated != null) {
+      // Keep the same id
+      updated.id = alarm.id;
+      alarms[index] = updated;
+      setState(() {});
+      await _saveAlarms();
+      // Reschedule or cancel based on enabled
+      try { await AlarmIntegration.cancel(updated.id); } catch (_) {}
+      if (updated.enabled) {
+        final when = _computeNextDateFor(updated);
+        await AlarmIntegration.schedule(
+          id: updated.id,
+          label: updated.label.isEmpty ? 'Alarm' : updated.label,
+          when: when,
+        );
+      }
+    }
+  }
+
+  DateTime _computeNextDateFor(Alarm alarm) {
+    final now = DateTime.now();
+    final hour24 = (alarm.isAm) ? (alarm.hour % 12) : ((alarm.hour % 12) + 12);
+    DateTime candidate = DateTime(
+      now.year,
+      now.month,
+      now.day,
+      hour24,
+      alarm.minute,
+    );
+
+    if (!candidate.isAfter(now)) {
+      candidate = candidate.add(const Duration(days: 1));
+    }
+
+    if (alarm.repeatDays.isNotEmpty) {
+      for (int i = 0; i < 7; i++) {
+        final day = candidate.add(Duration(days: i));
+        final wd = day.weekday; // 1..7
+        if (alarm.repeatDays.contains(wd)) {
+          return DateTime(day.year, day.month, day.day, hour24, alarm.minute);
+        }
+      }
+    }
+
+    return candidate;
   }
 }
 
@@ -373,7 +507,7 @@ class _AlarmCard extends StatefulWidget {
 }
 
 class _AlarmCardState extends State<_AlarmCard> {
-  bool enabled = true;
+  late bool enabled;
 
   @override
   Widget build(BuildContext context) {
@@ -413,15 +547,74 @@ class _AlarmCardState extends State<_AlarmCard> {
           const Spacer(),
 
           // ===== TOGGLE =====
-          Switch(value: enabled, onChanged: (v) => setState(() => enabled = v)),
+          Switch(
+            value: enabled,
+            onChanged: (v) async {
+              setState(() => enabled = v);
+              alarm.enabled = v;
+              // Persist and schedule/cancel
+              final state = context.findAncestorStateOfType<_AlarmScreenState>();
+              if (state != null) {
+                await state._saveAlarms();
+              }
+              if (v) {
+                final when = _nextDateFor(alarm);
+                await AlarmIntegration.schedule(
+                  id: alarm.id,
+                  label: alarm.label.isEmpty ? 'Alarm' : alarm.label,
+                  when: when,
+                );
+              } else {
+                try { await AlarmIntegration.cancel(alarm.id); } catch (_) {}
+              }
+            },
+          ),
         ],
       ),
     );
   }
 
+  @override
+  void initState() {
+    super.initState();
+    enabled = widget.alarm.enabled;
+  }
+
   String _repeatText(List<int> days) {
     const map = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
     return days.map((d) => map[d - 1]).join(', ');
+  }
+
+  DateTime _nextDateFor(Alarm alarm) {
+    final now = DateTime.now();
+    // Convert to 24h based on AM/PM
+    final hour24 = (alarm.isAm) ? (alarm.hour % 12) : ((alarm.hour % 12) + 12);
+    DateTime candidate = DateTime(
+      now.year,
+      now.month,
+      now.day,
+      hour24,
+      alarm.minute,
+    );
+
+    // If time today already passed, move to next day
+    if (!candidate.isAfter(now)) {
+      candidate = candidate.add(const Duration(days: 1));
+    }
+
+    // If repeating, find the next matching weekday (1=Mon ... 7=Sun)
+    if (alarm.repeatDays.isNotEmpty) {
+      for (int i = 0; i < 7; i++) {
+        final day = candidate.add(Duration(days: i));
+        final wd = day.weekday; // 1..7
+        if (alarm.repeatDays.contains(wd)) {
+          // Return the time on this matching day
+          return DateTime(day.year, day.month, day.day, hour24, alarm.minute);
+        }
+      }
+    }
+
+    return candidate;
   }
 }
 
@@ -432,6 +625,237 @@ class NewAlarmSheet extends StatefulWidget {
   State<NewAlarmSheet> createState() => _NewAlarmSheetState();
 }
 
+class EditAlarmSheet extends StatefulWidget {
+  final Alarm alarm;
+  const EditAlarmSheet({super.key, required this.alarm});
+
+  @override
+  State<EditAlarmSheet> createState() => _EditAlarmSheetState();
+}
+
+class _EditAlarmSheetState extends State<EditAlarmSheet> {
+  late int hour;
+  late int minute;
+  late bool isAm;
+  late bool sunrise;
+  late String label;
+  late Set<int> repeat;
+
+  @override
+  void initState() {
+    super.initState();
+    final a = widget.alarm;
+    hour = a.hour;
+    minute = a.minute;
+    isAm = a.isAm;
+    sunrise = a.sunrise;
+    label = a.label;
+    repeat = a.repeatDays.toSet();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: EdgeInsets.only(
+        left: 20,
+        right: 20,
+        top: 20,
+        bottom: MediaQuery.of(context).viewInsets.bottom + 20,
+      ),
+      decoration: const BoxDecoration(
+        color: Color(0xFF0B0F17),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      child: SingleChildScrollView(
+        child: Column(
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text('Edit Alarm', style: TextStyle(fontSize: 18)),
+                IconButton(
+                  icon: const Icon(Icons.close),
+                  onPressed: () => Navigator.pop(context),
+                ),
+              ],
+            ),
+
+            const SizedBox(height: 24),
+
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                _timeWheel(
+                  value: hour,
+                  max: 12,
+                  onChanged: (v) => setState(() => hour = v),
+                ),
+                const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 8),
+                  child: Text(':', style: TextStyle(fontSize: 42)),
+                ),
+                _timeWheel(
+                  value: minute,
+                  max: 59,
+                  onChanged: (v) => setState(() => minute = v),
+                ),
+                const SizedBox(width: 16),
+                Column(
+                  children: [
+                    _ampmButton('AM', isAm, () => setState(() => isAm = true)),
+                    const SizedBox(height: 8),
+                    _ampmButton('PM', !isAm, () => setState(() => isAm = false)),
+                  ],
+                ),
+              ],
+            ),
+
+            const SizedBox(height: 24),
+
+            TextField(
+              decoration: const InputDecoration(
+                labelText: 'Label',
+                hintText: 'Alarm label',
+              ),
+              controller: TextEditingController(text: label),
+              onChanged: (v) => label = v,
+            ),
+
+            const SizedBox(height: 20),
+
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Text('Repeat', style: TextStyle(color: Colors.white70)),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: List.generate(7, (i) {
+                // 1=Mon ... 7=Sun
+                final labels = ['M', 'Tu', 'W', 'Th', 'F', 'Sa', 'Su'];
+                final day = i + 1;
+                final selected = repeat.contains(day);
+                return GestureDetector(
+                  onTap: () => setState(() {
+                    selected ? repeat.remove(day) : repeat.add(day);
+                  }),
+                  child: CircleAvatar(
+                    radius: 20,
+                    backgroundColor:
+                        selected ? Colors.blue : const Color(0xFF1C2330),
+                    child: Text(labels[i]),
+                  ),
+                );
+              }),
+            ),
+
+            const SizedBox(height: 20),
+
+            Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: Theme.of(context).cardColor,
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: Row(
+                children: [
+                  const CircleAvatar(
+                    backgroundColor: Colors.orange,
+                    child: Icon(Icons.wb_sunny),
+                  ),
+                  const SizedBox(width: 12),
+                  const Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('Sunrise Alarm'),
+                        Text(
+                          'Gradual screen brightness',
+                          style: TextStyle(color: Colors.white54, fontSize: 12),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Switch(
+                    value: sunrise,
+                    onChanged: (v) => setState(() => sunrise = v),
+                  ),
+                ],
+              ),
+            ),
+
+            const SizedBox(height: 28),
+
+            FilledButton(
+              onPressed: () {
+                Navigator.pop(
+                  context,
+                  Alarm(
+                    id: widget.alarm.id,
+                    hour: hour,
+                    minute: minute,
+                    isAm: isAm,
+                    label: label,
+                    repeatDays: repeat.toList(),
+                    sunrise: sunrise,
+                    enabled: widget.alarm.enabled,
+                  ),
+                );
+              },
+              child: const Text('Save Changes'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _ampmButton(String t, bool active, VoidCallback onTap) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        width: 60,
+        padding: const EdgeInsets.symmetric(vertical: 8),
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: active ? Colors.blue : const Color(0xFF1C2330),
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Text(t),
+      ),
+    );
+  }
+
+  Widget _timeWheel({
+    required int value,
+    required int max,
+    required ValueChanged<int> onChanged,
+  }) {
+    return SizedBox(
+      width: 70,
+      height: 140,
+      child: ListWheelScrollView.useDelegate(
+        controller: FixedExtentScrollController(
+          // For hours: 12 maps to index 0; minutes map directly
+          initialItem: (value == max) ? 0 : value,
+        ),
+        itemExtent: 42,
+        perspective: 0.002,
+        physics: const FixedExtentScrollPhysics(),
+        onSelectedItemChanged: (i) => onChanged(i == 0 ? max : i),
+        childDelegate: ListWheelChildBuilderDelegate(
+          childCount: max + 1,
+          builder: (_, i) => Center(
+            child: Text(
+              i.toString().padLeft(2, '0'),
+              style: const TextStyle(fontSize: 32),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
 class _NewAlarmSheetState extends State<NewAlarmSheet> {
   int hour = 12;
   int minute = 0;
@@ -477,26 +901,17 @@ class _NewAlarmSheetState extends State<NewAlarmSheet> {
   }
 
   Future<bool> requestNotificationPermission() async {
-  if (!Platform.isAndroid) return true;
-
-  final plugin = FlutterLocalNotificationsPlugin();
-  final android = plugin
-      .resolvePlatformSpecificImplementation<
-          AndroidFlutterLocalNotificationsPlugin>();
-
-  if (android == null) return true;
-
-  final enabled = await android.areNotificationsEnabled();
-  if (enabled == true) return true;
-
-  // Open notification settings
-  const channel = MethodChannel('serenity/notification_settings');
-  try {
-    await channel.invokeMethod('openNotificationSettings');
-  } catch (_) {}
-
-  return false;
-}
+    if (!Platform.isAndroid) return true;
+    final status = await Permission.notification.status;
+    if (status.isGranted) return true;
+    final res = await Permission.notification.request();
+    if (res.isGranted) return true;
+    const channel = MethodChannel('serenity/notification_settings');
+    try {
+      await channel.invokeMethod('openNotificationSettings');
+    } catch (_) {}
+    return false;
+  }
 
 
   @override
@@ -656,23 +1071,23 @@ class _NewAlarmSheetState extends State<NewAlarmSheet> {
                 final id = DateTime.now().millisecondsSinceEpoch ~/ 1000;
 
                 try {
-                  await NotificationService.scheduleAlarm(
+                  await AlarmIntegration.schedule(
                     id: id,
-                    title: label.isEmpty ? 'Alarm' : label,
-                    body: 'It’s time ⏰',
-                    dateTime: alarmTime,
-                    repeat: repeat.isNotEmpty,
+                    label: label.isEmpty ? 'Alarm' : label,
+                    when: alarmTime,
                   );
 
                   Navigator.pop(
                     context,
                     Alarm(
+                      id: id,
                       hour: hour,
                       minute: minute,
                       isAm: isAm,
                       label: label,
                       repeatDays: repeat.toList(),
                       sunrise: sunrise,
+                      enabled: true,
                     ),
                   );
                 } on PlatformException catch (e) {
@@ -685,6 +1100,10 @@ class _NewAlarmSheetState extends State<NewAlarmSheet> {
                           'Enable "Schedule exact alarms" to allow alarms to ring on time.',
                         ),
                         actions: [
+                          TextButton(
+                            onPressed: () => Navigator.pop(context),
+                            child: const Text('Not now'),
+                          ),
                           TextButton(
                             onPressed: () async {
                               Navigator.pop(context);
@@ -1697,109 +2116,84 @@ class _SectionTitle extends StatelessWidget {
   }
 }
 
-class NotificationService {
-  static final _plugin = FlutterLocalNotificationsPlugin();
+class RingingScreen extends StatelessWidget {
+  final int alarmId;
+  final String label;
+  const RingingScreen({super.key, required this.alarmId, required this.label});
 
-  static Future<void> init() async {
-    const android = AndroidInitializationSettings('@mipmap/ic_launcher');
-    const ios = DarwinInitializationSettings();
-
-    const settings = InitializationSettings(android: android, iOS: ios);
-
-    await _plugin.initialize(settings);
-
-    // Initialize timezone database and set local timezone robustly.
-    tz.initializeTimeZones();
-    String tzName = 'UTC';
-    try {
-      final dynamic localTz = await FlutterTimezone.getLocalTimezone();
-      if (localTz is String && localTz.isNotEmpty) {
-        tzName = localTz;
-      } else if (localTz != null) {
-        final s = localTz.toString();
-        final match = RegExp(r'([A-Za-z]+\/[A-Za-z_]+)').firstMatch(s);
-        if (match != null)
-          tzName = match.group(0)!;
-        else if (s.isNotEmpty)
-          tzName = s;
-      }
-      try {
-        tz.setLocalLocation(tz.getLocation(tzName));
-      } catch (_) {
-        tz.setLocalLocation(tz.getLocation('UTC'));
-      }
-    } catch (_) {
-      // If anything fails, default to UTC to avoid crashes.
-      tz.setLocalLocation(tz.getLocation('UTC'));
-    }
-
-    // Ensure Android notification channel exists (important on Android 8+).
-    try {
-      final androidPlatform = _plugin
-          .resolvePlatformSpecificImplementation<
-            AndroidFlutterLocalNotificationsPlugin
-          >();
-      const channel = AndroidNotificationChannel(
-        'alarm_channel',
-        'Alarms',
-        description: 'Channel for alarm notifications',
-        importance: Importance.max,
-      );
-      await androidPlatform?.createNotificationChannel(channel);
-    } catch (e) {
-      // ignore channel creation failures, notifications may still work
-    }
-  }
-
-  static Future<void> scheduleAlarm({
-    required int id,
-    required String title,
-    required String body,
-    required DateTime dateTime,
-    required bool repeat,
-  }) async {
-    try {
-      await _plugin.zonedSchedule(
-        id,
-        title,
-        body,
-        tz.TZDateTime.from(dateTime, tz.local),
-        const NotificationDetails(
-          android: AndroidNotificationDetails(
-            'alarm_channel',
-            'Alarms',
-            importance: Importance.max,
-            priority: Priority.high,
-            fullScreenIntent: true,
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: SafeArea(
+        child: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Icon(Icons.access_alarm, size: 72),
+              const SizedBox(height: 16),
+              Text(label.isEmpty ? 'Alarm' : label, style: Theme.of(context).textTheme.displayLarge, textAlign: TextAlign.center),
+              const SizedBox(height: 24),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  FilledButton(
+                    onPressed: () async {
+                      try { await AlarmIntegration.cancel(alarmId); } catch (_) {}
+                      try {
+                        await const MethodChannel('serenity/alarm_manager').invokeMethod('stopRinging', {
+                          'id': alarmId,
+                        });
+                        await const MethodChannel('serenity/alarm_manager').invokeMethod('finishActivity');
+                      } catch (_) {}
+                      // Mark the alarm disabled in persisted list
+                      try {
+                        final p = await SharedPreferences.getInstance();
+                        final s = p.getString('alarms') ?? '[]';
+                        final arr = (jsonDecode(s) as List).map((e) => Map<String, dynamic>.from(e)).toList();
+                        for (final e in arr) {
+                          if ((e['id'] as num?)?.toInt() == alarmId) {
+                            e['enabled'] = false;
+                          }
+                        }
+                        await p.setString('alarms', jsonEncode(arr));
+                      } catch (_) {}
+                      navigatorKey.currentState?.popUntil((r) => r.isFirst);
+                    },
+                    child: const Text('Stop'),
+                  ),
+                  const SizedBox(width: 16),
+                  OutlinedButton(
+                    onPressed: () async {
+                      try {
+                        await const MethodChannel('serenity/alarm_manager').invokeMethod('stopRinging', {
+                          'id': alarmId,
+                        });
+                        await const MethodChannel('serenity/alarm_manager').invokeMethod('finishActivity');
+                      } catch (_) {}
+                      final now = DateTime.now().add(const Duration(minutes: 5));
+                      await AlarmIntegration.schedule(id: DateTime.now().millisecondsSinceEpoch ~/ 1000, label: label, when: now);
+                      // Also mark the current alarm disabled so it doesn't re-ring
+                      try {
+                        final p = await SharedPreferences.getInstance();
+                        final s = p.getString('alarms') ?? '[]';
+                        final arr = (jsonDecode(s) as List).map((e) => Map<String, dynamic>.from(e)).toList();
+                        for (final e in arr) {
+                          if ((e['id'] as num?)?.toInt() == alarmId) {
+                            e['enabled'] = false;
+                          }
+                        }
+                        await p.setString('alarms', jsonEncode(arr));
+                      } catch (_) {}
+                      navigatorKey.currentState?.popUntil((r) => r.isFirst);
+                    },
+                    child: const Text('Snooze 5 min'),
+                  ),
+                ],
+              ),
+            ],
           ),
-          iOS: DarwinNotificationDetails(),
         ),
-        androidAllowWhileIdle: true,
-        uiLocalNotificationDateInterpretation:
-            UILocalNotificationDateInterpretation.absoluteTime,
-        matchDateTimeComponents: repeat
-            ? DateTimeComponents.dayOfWeekAndTime
-            : null,
-      );
-    } on PlatformException catch (e, st) {
-      // Log platform error details to help debugging
-      // ignore: avoid_print
-      print(
-        'PlatformException scheduling notification: code=${e.code} message=${e.message} details=${e.details}',
-      );
-      // ignore: avoid_print
-      print(st);
-      rethrow;
-    } catch (e, st) {
-      // ignore: avoid_print
-      print('Error scheduling notification: $e');
-      // ignore: avoid_print
-      print(st);
-      rethrow;
-    }
-  }
-
-  static Future<void> cancel(int id) async {
-    await _plugin.cancel(id);
+      ),
+    );
   }
 }
